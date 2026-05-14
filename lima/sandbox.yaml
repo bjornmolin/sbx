@@ -18,12 +18,10 @@ cpus: 4
 memory: "8GiB"
 disk: "60GiB"
 
-# Broad mount: $HOME. Any project under $HOME can be sandboxed without a VM
-# restart. Each project's CONTAINER still only sees its own directory via
-# nerdctl bind mount — Lima sees more than the container does, deliberately.
-mounts:
-- location: "~"
-  writable: true
+# Mounts are NOT defined here. The wrapper renders them from
+# ~/.config/sbx/config.json (key: mount_dirs) at VM creation time and on
+# `sbx add-mount`. Default config mounts only ~/dev, so dotfiles in $HOME
+# (~/.ssh, ~/.aws, ~/.gnupg, ...) are NOT visible inside the Lima VM.
 mountType: "virtiofs"
 
 containerd:

@@ -86,8 +86,8 @@ runs but never leak across projects.
 ## Multiple projects
 
 ```sh
-cd ~/code/projA && sbx setup     # registers projA, starts its proxy
-cd ~/code/projB && sbx setup     # registers projB, runs in parallel
+cd ~/dev/projA && sbx setup      # registers projA, starts its proxy
+cd ~/dev/projB && sbx setup      # registers projB, runs in parallel
                                  #   no new VM, no image rebuild
 
 sbx status --all                 # list every registered project + state
@@ -98,6 +98,26 @@ sbx reset --all                  # tear down every project
                                  #    'limactl delete sbx' if you want it gone)
 sbx prune                        # drop registry entries with no proxy container
 ```
+
+## Configured mount dirs (macOS only)
+
+The Lima VM only sees host directories listed in `~/.config/sbx/config.json`
+under `mount_dirs`. Default: `["~/dev"]`. This keeps `~/.ssh`, `~/.aws`,
+`~/.gnupg`, browser cookies and the like out of the VM entirely — they are
+not reachable even from a compromised proxy or a runc escape into the VM.
+Sandbox containers themselves never see anything outside `/work` regardless.
+
+```sh
+sbx mounts                       # list configured mount dirs
+sbx add-mount ~/code             # allow Lima to mount ~/code too
+                                 #   (restarts the shared VM; every project's
+                                 #    proxy is interrupted; prompts before doing it)
+```
+
+`sbx setup` refuses to register a project that isn't inside one of the
+configured mount dirs. The error message points at `add-mount`.
+
+On Linux there's no Lima layer; the file is ignored.
 
 ## Egress allowlist
 

@@ -34,6 +34,7 @@ HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 
 REGISTRY="${SBX_REGISTRY:-$HOME/.config/sbx/projects.json}"
+CONFIG="${SBX_CONFIG:-$HOME/.config/sbx/config.json}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -59,12 +60,74 @@ lima_running() {
   [[ "$(limactl list --format '{{.Status}}' "$SBX_LIMA" 2>/dev/null || true)" == "Running" ]]
 }
 
+# Render the YAML 'mounts:' block from the config. Each existing dir on the
+# host becomes a writable mount; non-existent paths are skipped so Lima
+# doesn't refuse to start.
+render_lima_mounts_to() {
+  local out="$1"
+  local md expanded any=0
+  : > "$out"
+  while IFS= read -r md; do
+    expanded="$(expand_tilde "$md")"
+    if [[ -d "$expanded" ]]; then
+      printf -- '- location: "%s"\n  writable: true\n' "$expanded" >> "$out"
+      any=1
+    fi
+  done < <(config_mount_dirs)
+  (( any )) || die "no configured mount_dirs exist on disk.
+  Edit $CONFIG, or run: bin/sbx add-mount <dir>"
+}
+
+# Build a Lima yaml by concatenating the base template with the rendered
+# 'mounts:' block. The base template intentionally omits 'mounts:'.
+build_lima_yaml_to() {
+  local out="$1"
+  local mounts_tmp; mounts_tmp="$(mktemp)"
+  render_lima_mounts_to "$mounts_tmp"
+  cp "$ROOT/lima/sandbox.yaml" "$out"
+  {
+    printf '\nmounts:\n'
+    cat "$mounts_tmp"
+  } >> "$out"
+  rm -f "$mounts_tmp"
+}
+
+# Splice the 'mounts:' block of an existing Lima instance config in place.
+# Used when add-mount is run against an already-created VM (requires
+# limactl stop+start to take effect — that's the caller's responsibility).
+splice_lima_mounts() {
+  local file="$1"
+  local mounts_tmp; mounts_tmp="$(mktemp)"
+  render_lima_mounts_to "$mounts_tmp"
+  local tmp; tmp="$(mktemp)"
+  awk -v mfile="$mounts_tmp" '
+    /^mounts:/ {
+      print "mounts:"
+      while ((getline line < mfile) > 0) print line
+      close(mfile)
+      in_mounts = 1
+      next
+    }
+    in_mounts {
+      # The mounts block ends at the next non-indented, non-dash line.
+      if ($0 ~ /^[A-Za-z]/) { in_mounts = 0; print; next }
+      next
+    }
+    { print }
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+  rm -f "$mounts_tmp"
+}
+
 ensure_runtime() {
   case "$PLATFORM" in
     darwin)
       if ! limactl list -q 2>/dev/null | grep -qx "$SBX_LIMA"; then
-        log "creating shared Lima VM '$SBX_LIMA' (one-time, ~/${HOME##*/} mounted)"
-        limactl create --name "$SBX_LIMA" "$ROOT/lima/sandbox.yaml"
+        log "creating shared Lima VM '$SBX_LIMA' (one-time)"
+        local tmp; tmp="$(mktemp -t sbx-lima.XXXXXX)"
+        build_lima_yaml_to "$tmp"
+        limactl create --name "$SBX_LIMA" "$tmp"
+        rm -f "$tmp"
       fi
       if ! lima_running; then
         log "starting Lima VM '$SBX_LIMA'"
@@ -104,6 +167,57 @@ registry_delete() {
 registry_list_pairs() {
   ensure_registry
   jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$REGISTRY"
+}
+
+# ---------------------------------------------------------------------------
+# Config (~/.config/sbx/config.json)
+#
+# Holds the list of host directories Lima is allowed to mount into the VM.
+# Default: ["~/dev"]. The narrower this list, the less the Lima VM can see
+# of $HOME if anything ever pivots through the container into the VM —
+# dotfiles like ~/.ssh, ~/.aws, ~/.gnupg stay invisible.
+# Linux skips this entirely (no VM, no mount layer to scope).
+# ---------------------------------------------------------------------------
+ensure_config() {
+  mkdir -p "$(dirname "$CONFIG")"
+  [[ -f "$CONFIG" ]] || printf '{\n  "mount_dirs": ["~/dev"]\n}\n' > "$CONFIG"
+}
+
+config_mount_dirs() {
+  ensure_config
+  jq -r '.mount_dirs[]' "$CONFIG"
+}
+
+# Add a directory to the mount list (does not apply to the live VM —
+# cmd_add_mount handles that and asks before restarting Lima).
+config_add_mount_dir() {
+  ensure_config
+  local tmp; tmp="$(mktemp)"
+  jq --arg d "$1" '.mount_dirs |= (. + [$d] | unique)' "$CONFIG" > "$tmp"
+  mv "$tmp" "$CONFIG"
+}
+
+# Expand a leading ~ to $HOME so the rest of the wrapper can treat the
+# result as an absolute path. Avoid `${1#~/}` because bash tilde-expands
+# the pattern itself before matching, defeating the strip.
+expand_tilde() {
+  case "$1" in
+    "~")    printf '%s' "$HOME" ;;
+    "~/"*)  printf '%s/%s' "$HOME" "${1:2}" ;;
+    *)      printf '%s' "$1" ;;
+  esac
+}
+
+# Echo the configured mount dir whose expansion contains $1 — empty if none.
+mount_dir_containing() {
+  local target="$1" md expanded
+  while IFS= read -r md; do
+    expanded="$(expand_tilde "$md")"
+    case "$target" in
+      "$expanded"|"$expanded"/*) printf '%s' "$md"; return 0 ;;
+    esac
+  done < <(config_mount_dirs)
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -263,11 +377,73 @@ cmd_setup() {
   Work inside that one, or move this dir to register it separately."
   fi
 
+  # macOS only: refuse to register a project that Lima can't see. Linux
+  # has no Lima layer and no mount scoping; setup accepts any path.
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    local md; md="$(mount_dir_containing "$pdir")"
+    if [[ -z "$md" ]]; then
+      die "this dir is not under any configured Lima mount:
+  $pdir
+  Currently mounted: $(config_mount_dirs | paste -sd ' ' -)
+  Either move the project under one of those dirs, or add a new mount with:
+      bin/sbx add-mount <parent-dir>
+  (adding a mount restarts the shared Lima VM)"
+    fi
+  fi
+
   ensure_runtime
   ensure_images
   registry_set "$pid" "$pdir"
   ensure_project_proxy "$pid" "$pdir"
   log "setup complete. project: $pdir  id: $pid"
+}
+
+cmd_mounts() {
+  ensure_config
+  if [[ "$PLATFORM" == "linux" ]]; then
+    echo "(Linux: mount_dirs is unused — no Lima layer to scope.)"
+  fi
+  config_mount_dirs
+}
+
+cmd_add_mount() {
+  local dir="${1:-}"
+  [[ -n "$dir" ]] || die "usage: bin/sbx add-mount <dir>"
+  dir="$(expand_tilde "$dir")"
+  [[ -d "$dir" ]] || die "not a directory: $dir"
+  dir="$(cd "$dir" && pwd)"
+  if [[ "$PLATFORM" == "linux" ]]; then
+    config_add_mount_dir "$dir"
+    log "added $dir to mount_dirs (note: Linux ignores this list)."
+    return 0
+  fi
+
+  if [[ -n "$(mount_dir_containing "$dir")" ]]; then
+    log "$dir is already covered by an existing mount; nothing to do."
+    return 0
+  fi
+
+  config_add_mount_dir "$dir"
+  log "added $dir to mount_dirs."
+
+  if ! limactl list -q 2>/dev/null | grep -qx "$SBX_LIMA"; then
+    log "(Lima VM not yet created — mount takes effect on first 'bin/sbx setup'.)"
+    return 0
+  fi
+
+  log "applying to the running Lima VM. This will RESTART the VM and"
+  log "interrupt every running project's proxy/sandbox container."
+  if [[ -t 0 ]]; then
+    read -r -p "[sbx] continue? [y/N] " yn
+    [[ "$yn" =~ ^[Yy]$ ]] || die "cancelled."
+  fi
+
+  splice_lima_mounts "$HOME/.lima/$SBX_LIMA/lima.yaml"
+  log "stopping Lima VM"
+  limactl stop "$SBX_LIMA" >/dev/null 2>&1 || true
+  log "starting Lima VM"
+  limactl start "$SBX_LIMA" >/dev/null 2>&1
+  log "mount applied. Re-run 'bin/sbx up' from each project you want back online."
 }
 
 cmd_reset() {
@@ -472,6 +648,9 @@ Commands:
   logs               Tail the current project's proxy logs.
   run [opts] -- CMD  Run CMD in the sandbox of the project owning \$PWD.
   shell [opts]       Interactive fish shell in the sandbox.
+  mounts             List host dirs the Lima VM is allowed to mount (macOS).
+  add-mount <dir>    Allow Lima to mount <dir>. Restarts the shared VM,
+                     which interrupts every running project (macOS only).
 
 run options:
   --dir PATH         Cwd inside the project tree (default: \$PWD).
@@ -499,6 +678,8 @@ case "$cmd" in
   logs)         cmd_logs         "$@" ;;
   run)          cmd_run          "$@" ;;
   shell)        cmd_shell        "$@" ;;
+  mounts)       cmd_mounts       "$@" ;;
+  add-mount)    cmd_add_mount    "$@" ;;
   ""|-h|--help) usage ;;
   *)            usage; exit 2 ;;
 esac
