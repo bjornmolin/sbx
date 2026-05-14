@@ -343,6 +343,68 @@ proxy_ip_for() {
     | sed -E 's/.*"([0-9.]+)".*/\1/'
 }
 
+# ---------------------------------------------------------------------------
+# Post-run symlink audit
+#
+# A process inside the sandbox can drop a symlink in /work that points
+# outside the project (e.g. /work/innocent.txt -> /Users/me/.ssh/id_ed25519).
+# The sandbox itself can't follow such links — host paths don't exist in its
+# namespace — but any host-side tool that later traverses the project dir
+# (your editor, grep, git pre-commit hooks) WILL follow them and read host
+# files. The audit warns after every `sbx run` so the user can delete the
+# bait before anything innocent follows it.
+# ---------------------------------------------------------------------------
+
+# Collapse '.' and '..' in a path string without requiring the path to exist
+# (so we can normalize symlink targets even when they're broken).
+_normalize_path() {
+  perl -e '
+    my @out;
+    for (split /\//, $ARGV[0]) {
+      next if $_ eq "" || $_ eq ".";
+      if ($_ eq "..") { pop @out if @out; next; }
+      push @out, $_;
+    }
+    print "/" . join("/", @out);
+  ' "$1"
+}
+
+audit_workdir_symlinks() {
+  local root="$1"
+  command -v perl >/dev/null 2>&1 || return 0   # silently skip if no perl
+  local bad=() link target abs normalized
+  while IFS= read -r link; do
+    [[ -z "$link" ]] && continue
+    target="$(readlink "$link" 2>/dev/null || true)"
+    [[ -z "$target" ]] && continue
+
+    if [[ "$target" == /* ]]; then
+      abs="$target"
+    elif [[ "$target" == *..* ]]; then
+      abs="$(cd "$(dirname "$link")" 2>/dev/null && pwd)/$target"
+    else
+      # Relative target with no .. — stays under the project. Common case
+      # (e.g. node_modules' internal symlinks); not interesting.
+      continue
+    fi
+    normalized="$(_normalize_path "$abs")"
+    case "$normalized" in
+      "$root"|"$root"/*) ;;  # still inside the project
+      *) bad+=("$(printf '%s -> %s' "${link#"$root"/}" "$target")") ;;
+    esac
+  done < <(find "$root" -type l 2>/dev/null)
+
+  if (( ${#bad[@]} > 0 )); then
+    log "WARNING: ${#bad[@]} symlink(s) in this project point OUTSIDE the workdir."
+    log "Host tools following these would read host files. To inspect:"
+    local b
+    for b in "${bad[@]}"; do
+      log "  $b"
+    done
+    log "Remove with: find \"$root\" -type l -name '<file>' -delete"
+  fi
+}
+
 teardown_project() {
   local pid="$1"
   local proxy int vol
@@ -572,6 +634,7 @@ cmd_run() {
   local tty_flags=()
   if (( interactive )) && [[ -t 0 && -t 1 ]]; then tty_flags=(-it); fi
 
+  local rc=0
   nerdctl run --rm "${tty_flags[@]}" \
     --network "$(int_net_for "$pid")" \
     --dns "$proxy_ip" \
@@ -581,7 +644,10 @@ cmd_run() {
     -w "$container_wd" \
     -e HOME=/home/dev \
     -e TERM="${TERM:-xterm-256color}" \
-    "$SANDBOX_IMAGE" "$@"
+    "$SANDBOX_IMAGE" "$@" || rc=$?
+
+  audit_workdir_symlinks "$pdir"
+  return "$rc"
 }
 
 cmd_shell() { cmd_run "$@" -- fish --login; }
