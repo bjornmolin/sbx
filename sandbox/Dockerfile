@@ -59,10 +59,23 @@ RUN ARCH=$(dpkg --print-architecture) \
 RUN curl -LsSf https://astral.sh/uv/install.sh | \
       env UV_INSTALL_DIR=/usr/local/bin UV_UNMANAGED_INSTALL=/usr/local/bin sh
 
-# --- user matching macOS host (UID 501, GID 20) -----------------------------
-# GID 20 exists on Ubuntu as 'dialout'; reuse it as the user's primary group
-# so the numeric ownership matches the host without renaming system groups.
-RUN useradd -u ${USER_UID} -g ${USER_GID} -m -s /usr/bin/fish ${USERNAME} \
+# --- user matching the host (UID/GID passed in as build args) ---------------
+# Numeric ownership is what carries host file ownership across the boundary;
+# the user/group *names* inside the image are arbitrary. Handle the two
+# collision cases that come up in practice:
+#   - GID already exists as a system group (e.g. GID 20 = 'dialout' on Ubuntu
+#     from macOS, or GID 100 = 'users'): reuse it as the new user's primary
+#     group instead of refusing to create a duplicate.
+#   - UID already taken by a default account in the base image (rare for
+#     Docker Hub's ubuntu:24.04, common in cloud images at UID 1000): remove
+#     that account first so useradd can take the slot.
+RUN if getent passwd ${USER_UID} >/dev/null; then \
+      userdel -r "$(getent passwd ${USER_UID} | cut -d: -f1)" 2>/dev/null || true; \
+    fi \
+ && if ! getent group ${USER_GID} >/dev/null; then \
+      groupadd -g ${USER_GID} ${USERNAME}; \
+    fi \
+ && useradd -u ${USER_UID} -g ${USER_GID} -m -s /usr/bin/fish ${USERNAME} \
  && mkdir -p /home/${USERNAME}/.local/bin /work \
  && chown -R ${USER_UID}:${USER_GID} /home/${USERNAME} /work
 
