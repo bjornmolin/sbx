@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Defensive: allowlist.local.conf belongs in a project repo, not here.
+# If someone drops one in this tool repo by habit, don't track it.
+allowlist.local.conf

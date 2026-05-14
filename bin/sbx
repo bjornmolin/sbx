@@ -1,0 +1,451 @@
+#!/usr/bin/env bash
+# sbx — run CLI tools (claude, opencode, cargo, npm, ...) inside an
+# egress-filtered Lima/nerdctl sandbox. See README.md for the full picture.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Paths & constants
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Each project gets its own Lima VM (named sbx-<base>-<hash>). The active
+# instance is selected per-invocation by deriving the name from the project
+# the user is currently in, or by listing all 'sbx-*' instances.
+LIMA_INSTANCE=""
+
+# These names live inside a given VM (one per VM), so they do not need to be
+# parameterised per-project: each VM has its own networks/containers/volumes.
+NET_INTERNAL="sbx-internal"     # --internal: no outbound to the world
+NET_EXTERNAL="sbx-external"     # regular bridge: proxy uses this to reach the internet
+INTERNAL_SUBNET="10.88.0.0/24"
+SANDBOX_IMAGE="sbx-sandbox:latest"
+PROXY_IMAGE="sbx-proxy:latest"
+PROXY_CONTAINER="sbx-proxy"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+log() { printf '\033[1;36m[sbx]\033[0m %s\n' "$*" >&2; }
+die() { printf '\033[1;31m[sbx]\033[0m %s\n' "$*" >&2; exit 1; }
+
+lima_running() {
+  limactl list -q 2>/dev/null | grep -qx "$LIMA_INSTANCE" && \
+    [[ "$(limactl list --format '{{.Status}}' "$LIMA_INSTANCE" 2>/dev/null)" == "Running" ]]
+}
+
+nerdctl() { limactl shell "$LIMA_INSTANCE" -- nerdctl "$@"; }
+
+lima_exists() {
+  limactl list -q 2>/dev/null | grep -qx "$LIMA_INSTANCE"
+}
+
+# Read the mount location that was substituted into a given Lima instance's
+# config at `sbx setup` time. The mount block in lima.yaml has one entry with
+# `location: <abs-path>`, which is the source of truth for the project root.
+project_dir_for() {
+  local instance="$1"
+  local f="$HOME/.lima/$instance/lima.yaml"
+  [[ -f "$f" ]] || return 1
+  awk '
+    /^mounts:/        { in_mounts = 1; next }
+    in_mounts && /^[^ -]/ { in_mounts = 0 }
+    in_mounts && /^- *location:/ {
+      gsub(/^- *location: *"?/, ""); gsub(/"? *$/, "")
+      print; exit
+    }
+  ' "$f"
+}
+project_dir() { project_dir_for "$LIMA_INSTANCE"; }
+
+# All Lima instances created by sbx are named with the 'sbx-' prefix so we
+# can enumerate them without disturbing other Lima VMs the user might run.
+list_sbx_vms() {
+  limactl list -q 2>/dev/null | grep '^sbx-' || true
+}
+
+# Derive a stable VM name from an absolute project path. Format keeps a
+# human-readable slug for `limactl list` ergonomics plus 8 hex chars of hash
+# to disambiguate identically-named projects in different locations.
+vm_name_for_project() {
+  local p="$1"
+  local base
+  base="$(basename "$p" | LC_ALL=C tr -c 'A-Za-z0-9' '-' | tr 'A-Z' 'a-z')"
+  base="${base#-}"; base="${base%-}"; base="${base:-proj}"
+  base="${base:0:20}"
+  local hash; hash="$(printf '%s' "$p" | shasum -a 256 | cut -c1-8)"
+  printf 'sbx-%s-%s' "$base" "$hash"
+}
+
+# Find the sbx VM whose mount is a prefix of $1; longest-prefix wins so a VM
+# registered at ~/dev/foo beats one registered at ~/dev when called from
+# ~/dev/foo/src.
+discover_vm() {
+  local cwd="$1" best="" best_len=0
+  local inst mount
+  while IFS= read -r inst; do
+    [[ -z "$inst" ]] && continue
+    mount="$(project_dir_for "$inst")" || continue
+    [[ -z "$mount" ]] && continue
+    case "$cwd" in
+      "$mount"|"$mount"/*)
+        if (( ${#mount} > best_len )); then best="$inst"; best_len=${#mount}; fi
+        ;;
+    esac
+  done < <(list_sbx_vms)
+  printf '%s' "$best"
+  return 0
+}
+
+# Set $LIMA_INSTANCE based on $PWD, or die with a helpful message.
+require_vm() {
+  LIMA_INSTANCE="$(discover_vm "$PWD")"
+  [[ -n "$LIMA_INSTANCE" ]] || die "no sbx project owns this directory:
+  $PWD
+  cd into a registered project, or run 'bin/sbx setup' here to register it.
+  Use 'bin/sbx status --all' to list registered projects."
+}
+
+# Bring the VM up; create it from the template on first call. Refuses to
+# create a second VM under the same instance name with a different mount.
+ensure_lima() {
+  if ! lima_exists; then
+    local pdir="$PWD"
+    log "creating Lima VM '$LIMA_INSTANCE' with project mount: $pdir"
+    local tmp; tmp="$(mktemp -t sbx-lima.XXXXXX)"
+    # Escape any | in the path (rare on macOS) before feeding to sed.
+    local safe="${pdir//|/\\|}"
+    sed "s|__PROJECT_DIR__|${safe}|g" "$ROOT/lima/sandbox.yaml" > "$tmp"
+    limactl create --name "$LIMA_INSTANCE" "$tmp"
+    rm -f "$tmp"
+  fi
+  if ! lima_running; then
+    log "starting Lima VM '$LIMA_INSTANCE'"
+    limactl start "$LIMA_INSTANCE"
+  fi
+}
+
+ensure_networks() {
+  if ! nerdctl network ls --format '{{.Name}}' | grep -qx "$NET_INTERNAL"; then
+    log "creating internal network $NET_INTERNAL ($INTERNAL_SUBNET)"
+    nerdctl network create --internal --subnet "$INTERNAL_SUBNET" "$NET_INTERNAL"
+  fi
+  if ! nerdctl network ls --format '{{.Name}}' | grep -qx "$NET_EXTERNAL"; then
+    log "creating external network $NET_EXTERNAL"
+    nerdctl network create "$NET_EXTERNAL"
+  fi
+}
+
+# Push a host directory into the Lima VM at a VM-local path and echo that
+# path. Used to provide build contexts without exposing the sbx repo through
+# the Lima mount. The destination is wiped first so stale files cannot leak in.
+push_build_context() {
+  local src="$1" name="$2"
+  local dst="/tmp/sbx-ctx-${name}"
+  limactl shell "$LIMA_INSTANCE" -- rm -rf "$dst"
+  limactl shell "$LIMA_INSTANCE" -- mkdir -p "$dst"
+  # `tar | tar -x` over ssh is portable across limactl versions; `limactl cp -r`
+  # exists but had recursive-flag differences across releases.
+  tar -C "$src" -c . | limactl shell "$LIMA_INSTANCE" -- tar -C "$dst" -xf -
+  printf '%s' "$dst"
+}
+
+build_proxy_image() {
+  # The baseline allowlist comes from the sbx tool repo; per-project additions
+  # live next to the code they apply to, at <project>/allowlist.local.conf.
+  # Both are concatenated by render-config inside the image at container start.
+  local pdir; pdir="$(project_dir)"
+  [[ -n "$pdir" ]] || die "no project configured; run 'bin/sbx setup' from your project first"
+
+  local ctx; ctx="$(mktemp -d -t sbx-proxy-ctx.XXXXXX)"
+  cp -a "$ROOT/proxy/." "$ctx/"
+  cp "$ROOT/allowlist.conf" "$ctx/allowlist.conf"
+  # Per-project sbx config lives in <project>/.sbx/ (mirrors .git, .vscode,
+  # .devcontainer conventions). Currently only allowlist.local.conf is read.
+  local local_allow="$pdir/.sbx/allowlist.local.conf"
+  if [[ -f "$local_allow" ]]; then
+    cp "$local_allow" "$ctx/allowlist.local.conf"
+    log "including $local_allow"
+  else
+    : > "$ctx/allowlist.local.conf"  # empty placeholder so the COPY never fails
+  fi
+  local vm_ctx; vm_ctx="$(push_build_context "$ctx" proxy)"
+  nerdctl build -t "$PROXY_IMAGE" "$vm_ctx"
+  limactl shell "$LIMA_INSTANCE" -- rm -rf "$vm_ctx"
+  rm -rf "$ctx"
+}
+
+build_sandbox_image() {
+  local vm_ctx; vm_ctx="$(push_build_context "$ROOT/sandbox" sandbox)"
+  nerdctl build -t "$SANDBOX_IMAGE" "$vm_ctx"
+  limactl shell "$LIMA_INSTANCE" -- rm -rf "$vm_ctx"
+}
+
+build_images() {
+  log "building proxy image"
+  build_proxy_image
+  log "building sandbox image (this takes a while the first time)"
+  build_sandbox_image
+}
+
+proxy_running() {
+  nerdctl ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PROXY_CONTAINER"
+}
+
+ensure_proxy() {
+  if proxy_running; then return 0; fi
+  ensure_networks
+  if nerdctl ps -a --format '{{.Names}}' | grep -qx "$PROXY_CONTAINER"; then
+    nerdctl rm -f "$PROXY_CONTAINER" >/dev/null
+  fi
+  log "starting proxy"
+  # Rootless nerdctl has no `network connect`, so both networks are attached at
+  # run time. We do not pin the proxy IP because the host-local IPAM in rootless
+  # CNI is finicky about cleaning up stale reservations; instead, we discover
+  # the proxy's internal IP after start and pass it to sandbox runs as --dns.
+  nerdctl run -d \
+    --name "$PROXY_CONTAINER" \
+    --network "$NET_INTERNAL" \
+    --network "$NET_EXTERNAL" \
+    --dns 1.1.1.1 --dns 9.9.9.9 \
+    -e "INTERNAL_CIDR=${INTERNAL_SUBNET}" \
+    "$PROXY_IMAGE" >/dev/null
+}
+
+proxy_ip_on_internal() {
+  # nerdctl renames multi-attached networks to "unknown-ethN" in inspect, so we
+  # cannot look up by network name. Grep for the IP that falls inside the
+  # internal subnet ($INTERNAL_SUBNET = 10.88.0.0/24).
+  nerdctl container inspect "$PROXY_CONTAINER" 2>/dev/null \
+    | grep -oE '"IPAddress": "10\.88\.0\.[0-9]+"' \
+    | head -1 \
+    | sed -E 's/.*"([0-9.]+)".*/\1/'
+}
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_setup() {
+  local pdir="$PWD"
+  local target_vm; target_vm="$(vm_name_for_project "$pdir")"
+
+  # If a different sbx project already covers this path (parent registered),
+  # refuse — otherwise setup would create an overlapping mount.
+  local existing; existing="$(discover_vm "$pdir")"
+  if [[ -n "$existing" && "$existing" != "$target_vm" ]]; then
+    local existing_root; existing_root="$(project_dir_for "$existing")"
+    die "this directory is already inside another sbx project:
+  parent project: $existing_root  (VM: $existing)
+  Work inside that project, or move this dir to register it separately."
+  fi
+
+  LIMA_INSTANCE="$target_vm"
+  ensure_lima
+  ensure_networks
+  build_images
+  ensure_proxy
+  log "setup complete. project: $pdir  VM: $LIMA_INSTANCE"
+}
+
+teardown_vm() {
+  if proxy_running 2>/dev/null; then nerdctl rm -f "$PROXY_CONTAINER" >/dev/null 2>&1 || true; fi
+  log "stopping Lima VM $LIMA_INSTANCE"
+  limactl stop "$LIMA_INSTANCE" >/dev/null 2>&1 || true
+  log "deleting Lima VM $LIMA_INSTANCE"
+  limactl delete --force "$LIMA_INSTANCE" >/dev/null 2>&1 || true
+}
+
+cmd_reset() {
+  if [[ "${1:-}" == "--all" ]]; then
+    local count=0
+    while IFS= read -r inst; do
+      [[ -z "$inst" ]] && continue
+      LIMA_INSTANCE="$inst"
+      teardown_vm
+      count=$((count + 1))
+    done < <(list_sbx_vms)
+    log "reset complete. $count VM(s) removed."
+    return
+  fi
+
+  LIMA_INSTANCE="$(discover_vm "$PWD")"
+  if [[ -z "$LIMA_INSTANCE" ]]; then
+    log "no sbx VM owns this directory ($PWD). nothing to reset."
+    log "use 'bin/sbx reset --all' to wipe every sbx VM."
+    return
+  fi
+  teardown_vm
+  log "to recreate: cd to the project and run 'bin/sbx setup'."
+}
+
+cmd_build() {
+  require_vm
+  build_images
+}
+
+cmd_build_proxy() {
+  require_vm
+  build_proxy_image
+  if proxy_running; then
+    log "restarting proxy to pick up changes"
+    nerdctl rm -f "$PROXY_CONTAINER" >/dev/null
+  fi
+  ensure_proxy
+}
+
+cmd_up()   { require_vm; ensure_lima; ensure_networks; ensure_proxy; }
+cmd_down() {
+  require_vm
+  if proxy_running; then nerdctl rm -f "$PROXY_CONTAINER" >/dev/null; fi
+  log "proxy stopped for $LIMA_INSTANCE. Lima VM left running."
+}
+
+cmd_logs() {
+  require_vm
+  nerdctl logs -f "$PROXY_CONTAINER"
+}
+
+cmd_run() {
+  local cwd_in=""
+  local interactive=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir)  cwd_in="$2"; shift 2 ;;
+      --no-tty) interactive=0; shift ;;
+      --)     shift; break ;;
+      -h|--help) usage; exit 0 ;;
+      *)      break ;;
+    esac
+  done
+  [[ $# -gt 0 ]] || die "nothing to run. example:  sbx run -- cargo build"
+
+  # Resolve project from the target directory (after --dir resolution) so
+  # `sbx run --dir ~/other-project -- ...` selects the other project's VM.
+  local cwd_host
+  cwd_host="$(cd "${cwd_in:-$PWD}" 2>/dev/null && pwd)" || die "no such directory: ${cwd_in:-$PWD}"
+
+  LIMA_INSTANCE="$(discover_vm "$cwd_host")"
+  [[ -n "$LIMA_INSTANCE" ]] || die "no sbx project owns this directory:
+  $cwd_host
+  cd into a registered project, or run 'bin/sbx setup' to register it.
+  Use 'bin/sbx status --all' to list registered projects."
+
+  local proot; proot="$(project_dir)"
+  local rel="${cwd_host#"$proot"}"; rel="${rel#/}"
+  local container_wd="/work${rel:+/$rel}"
+
+  ensure_lima
+  ensure_proxy
+
+  local proxy_ip
+  proxy_ip="$(proxy_ip_on_internal)"
+  [[ -n "$proxy_ip" ]] || die "could not discover proxy IP on $NET_INTERNAL; try: sbx down && sbx up"
+
+  local tty_flags=()
+  if (( interactive )) && [[ -t 0 && -t 1 ]]; then tty_flags=(-it); fi
+
+  nerdctl run --rm "${tty_flags[@]}" \
+    --network "$NET_INTERNAL" \
+    --dns "$proxy_ip" \
+    --user 501:20 \
+    -v "${proot}:/work" \
+    -v "sbx-home:/home/dev" \
+    -w "$container_wd" \
+    -e HOME=/home/dev \
+    -e TERM="${TERM:-xterm-256color}" \
+    "$SANDBOX_IMAGE" "$@"
+}
+
+cmd_shell() {
+  cmd_run "$@" -- fish --login
+}
+
+cmd_status() {
+  if [[ "${1:-}" == "--all" ]]; then
+    local found=0
+    while IFS= read -r inst; do
+      [[ -z "$inst" ]] && continue
+      found=1
+      local st mnt
+      st="$(limactl list --format '{{.Status}}' "$inst" 2>/dev/null)"
+      mnt="$(project_dir_for "$inst")"
+      printf '%-48s  %-8s  %s\n' "$inst" "$st" "$mnt"
+    done < <(list_sbx_vms)
+    (( found )) || echo "no sbx projects registered. cd to a project and run: bin/sbx setup"
+    return 0
+  fi
+
+  LIMA_INSTANCE="$(discover_vm "$PWD")"
+  if [[ -z "$LIMA_INSTANCE" ]]; then
+    echo "no sbx project owns this directory ($PWD)."
+    echo "registered projects:  bin/sbx status --all"
+    return 0
+  fi
+  echo "Project:    $(project_dir)"
+  echo "VM:         $LIMA_INSTANCE"
+  echo "Lima:       $(limactl list --format '{{.Status}}' "$LIMA_INSTANCE")"
+  echo "Networks:   $(nerdctl network ls --format '{{.Name}}' 2>/dev/null | grep '^sbx' | tr '\n' ' ')"
+  echo -n "Proxy:      "
+  if proxy_running; then echo "running ($(proxy_ip_on_internal))"; else echo "stopped"; fi
+  echo "Images:"
+  nerdctl images --format '{{.Repository}}:{{.Tag}}  {{.Size}}' 2>/dev/null | grep '^sbx-' || echo "  (none built yet)"
+}
+
+usage() {
+  cat <<EOF
+sbx — egress-filtered sandbox for CLI tools
+
+Each project gets its own Lima VM mounting only that project's directory.
+Multiple projects can run in parallel; sbx picks the VM that owns \$PWD.
+
+Commands:
+  setup                Register the current dir as a project: create its
+                       Lima VM, build images, start its proxy.
+  reset                Tear down the Lima VM that owns \$PWD.
+                       'reset --all' wipes every sbx VM.
+  build                Rebuild both images in the current project's VM.
+  build-proxy          Rebuild proxy image and restart it (use after editing
+                       allowlist.conf or <project>/allowlist.local.conf).
+  up                   Start Lima + proxy for the current project (no build).
+  down                 Stop the proxy for the current project.
+  status               Show component state for the current project's VM.
+                       'status --all' lists every registered project.
+  logs                 Tail proxy logs (DNS queries + SNI decisions).
+  run [opts] -- CMD    Run CMD in a fresh sandbox container.
+  shell [opts]         Interactive fish shell in the sandbox.
+
+run options:
+  --dir PATH           Cwd inside the project tree (default: \$PWD).
+                       Must be inside a registered project.
+  --no-tty             Do not allocate a TTY (useful for piping).
+
+Examples:
+  cd ~/code/myproj && bin/sbx setup
+  cd ~/code/otherproj && bin/sbx setup     # second project in parallel
+  bin/sbx run -- cargo build               # uses the VM owning \$PWD
+  bin/sbx status --all                     # list every registered project
+  bin/sbx reset                            # tear down this project only
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+cmd="${1:-}"
+[[ $# -gt 0 ]] && shift || true
+case "$cmd" in
+  setup)        cmd_setup        "$@" ;;
+  reset)        cmd_reset        "$@" ;;
+  build)        cmd_build        "$@" ;;
+  build-proxy)  cmd_build_proxy  "$@" ;;
+  up)           cmd_up           "$@" ;;
+  down)         cmd_down         "$@" ;;
+  status)       cmd_status       "$@" ;;
+  logs)         cmd_logs         "$@" ;;
+  run)          cmd_run          "$@" ;;
+  shell)        cmd_shell        "$@" ;;
+  ""|-h|--help) usage ;;
+  *)            usage; exit 2 ;;
+esac

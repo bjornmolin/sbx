@@ -1,0 +1,35 @@
+# sniproxy config — the table below is generated at container start from
+# /etc/sbx/allowlist.conf. Edits made here directly will be overwritten.
+
+user nobody
+pidfile /var/run/sniproxy.pid
+
+error_log {
+    syslog daemon
+    priority notice
+}
+
+resolver {
+    # sniproxy uses real DNS for its own lookups (not the captive dnsmasq
+    # running in the same container). 1.1.1.1 / 9.9.9.9 are reachable because
+    # the proxy is attached to the external bridge network as well.
+    nameserver 1.1.1.1
+    nameserver 9.9.9.9
+    mode ipv4_only
+}
+
+listen 0.0.0.0:443 {
+    proto tls
+    table https_hosts
+
+    access_log {
+        filename /dev/stdout
+        priority notice
+    }
+
+    fallback localhost:9   # discard if SNI does not match the allowlist
+}
+
+table https_hosts {
+__ALLOWLIST_TABLE__
+}

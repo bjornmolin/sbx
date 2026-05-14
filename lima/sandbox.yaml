@@ -1,0 +1,42 @@
+# Lima VM template for the sbx sandbox.
+# Apple Virtualization framework + Rosetta for amd64 emulation.
+# Rootless containerd via nerdctl; nftables installed for the egress hard floor.
+
+images:
+- location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+  arch: "x86_64"
+- location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+
+vmType: "vz"
+# Rosetta defaults are applied by Lima itself; no explicit rosetta block needed.
+
+cpus: 4
+memory: "8GiB"
+disk: "60GiB"
+
+# The project root is the ONLY host path exposed to the VM. The wrapper
+# substitutes __PROJECT_DIR__ with $PWD at `sbx setup` time so the mount is
+# scoped to one project. Switch projects with `sbx reset && sbx setup`.
+mounts:
+- location: "__PROJECT_DIR__"
+  writable: true
+mountType: "virtiofs"
+
+# Rootless containerd is the whole point: no root daemon, no docker.sock.
+containerd:
+  system: false
+  user: true
+
+# No host port forwards by default; the sandbox does not expose anything.
+portForwards:
+- guestPortRange: [1, 65535]
+  ignore: true
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    apt-get update
+    apt-get install -y nftables
