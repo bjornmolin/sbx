@@ -24,14 +24,20 @@ fi
 sources=("$ALLOWLIST")
 [[ -f "$ALLOWLIST_LOCAL" ]] && sources+=("$ALLOWLIST_LOCAL")
 
-# Proxy IP advertised to sandbox containers. The proxy is dual-homed, so
-# `hostname -i` picks an arbitrary interface; the caller passes INTERNAL_CIDR
-# so we can select the address on the subnet the sandbox can actually reach.
-INTERNAL_CIDR="${INTERNAL_CIDR:?INTERNAL_CIDR env var must be set (e.g. 10.88.0.0/24)}"
-prefix="${INTERNAL_CIDR%/*}"
-prefix="${prefix%.*}."   # e.g. "10.88.0."
-PROXY_IP="$(ip -4 -o addr show | awk -v p="$prefix" '$4 ~ ("^"p) { sub(/\/.*/, "", $4); print $4; exit }')"
-[[ -n "$PROXY_IP" ]] || { echo "render-config: no interface on $INTERNAL_CIDR" >&2; exit 1; }
+# Proxy IP advertised to sandbox containers. The proxy is dual-homed (an
+# internal --internal network for the sandbox, plus an external bridge for
+# outbound). The internal interface is the one WITHOUT a default route, so
+# we discover it by elimination — no INTERNAL_CIDR env var required.
+default_iface="$(ip -4 route show default | awk '{print $5; exit}')"
+PROXY_IP="$(
+  ip -4 -o addr show |
+  awk -v def="$default_iface" '
+    $2 != "lo" && $2 != def && $4 ~ /^(10|172|192)\./ {
+      sub(/\/.*/, "", $4); print $4; exit
+    }
+  '
+)"
+[[ -n "$PROXY_IP" ]] || { echo "render-config: could not detect internal interface" >&2; exit 1; }
 
 # Render dnsmasq.
 sed "s|__PROXY_IP__|${PROXY_IP}|g" "$DNS_TMPL" > "$DNS_OUT"

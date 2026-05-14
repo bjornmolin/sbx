@@ -11,14 +11,10 @@ COPY sniproxy.conf.tmpl /etc/sniproxy.conf.tmpl
 COPY render-config.sh   /usr/local/bin/render-config.sh
 COPY entrypoint.sh      /usr/local/bin/entrypoint.sh
 
-# Allowlist is baked into the image at build time. The wrapper assembles a
-# build context that always contains both files (the local one may be empty)
-# so this COPY never fails. Edit allowlist.conf / allowlist.local.conf on the
-# host and run `sbx build-proxy` to apply.
-COPY allowlist.conf       /etc/sbx/allowlist.conf
-COPY allowlist.local.conf /etc/sbx/allowlist.local.conf
-
-RUN chmod +x /usr/local/bin/render-config.sh /usr/local/bin/entrypoint.sh
+# Allowlist files (baseline + optional project-local) are bind-mounted at
+# run time into /etc/sbx/. The image itself is project-agnostic and shared.
+RUN mkdir -p /etc/sbx \
+ && chmod +x /usr/local/bin/render-config.sh /usr/local/bin/entrypoint.sh
 
 EXPOSE 53/udp 443/tcp
 

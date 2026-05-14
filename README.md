@@ -27,33 +27,40 @@ Does **not** stop:
 
 ## Prerequisites
 
-- macOS with Lima (`brew install lima`) and `nerdctl` available via Lima.
-- Project lives anywhere on the host (each project gets its own VM that
-  mounts only that directory).
+- **macOS:** Lima (`brew install lima`) and `jq` (`brew install jq`).
+- **Linux:** rootless containerd + nerdctl (`containerd-rootless-setuptool.sh
+  install`) and `jq` (`apt install jq` / equivalent).
 
 ## Model in one paragraph
 
-**Each project gets its own Lima VM.** That VM mounts only the project's
-directory and only that directory. `bin/sbx setup` (run from inside the
-project) registers it: a VM named `sbx-<basename>-<8-hex-hash>` is created,
-proxy and sandbox images are built, the proxy starts. Subsequent `bin/sbx
-run`, `shell`, `status`, etc. find the right VM by matching `$PWD` against
-the registered mounts (longest-prefix wins, so nested registrations work).
-Multiple projects run in parallel — each has its own VM, networks, proxy,
-and `/home/dev` cache.
+**One container runtime, many projects in parallel.** On macOS a single
+shared Lima VM (`sbx`) with `$HOME` mounted hosts containerd; it's created
+once and never restarted when adding projects. On Linux the wrapper talks
+to rootless containerd directly with no VM layer. Per project: its own
+`--internal` nerdctl network, its own proxy container (with the project's
+allowlist bind-mounted in), and its own `/home/dev` cache volume. All
+projects share one proxy image and one sandbox image. Discovery is by
+longest-prefix match of `$PWD` against registered project paths. State of
+record: `~/.config/sbx/projects.json`.
 
-## First-time setup (per project)
+## First-time setup
+
+The very first `sbx setup` does the slow work once:
+
+- macOS only: creates the shared Lima VM (`sbx`) and starts it.
+- Builds the shared proxy + sandbox images. The sandbox image is ~3 GB
+  (Rust, Go, Node, Python, Java, Ruby, plus the devbase-core CLI subset:
+  ripgrep, fzf, bat, eza, delta, fd, fish, kubectl) and takes a few
+  minutes on first build.
+- Creates the project's internal network and starts its proxy.
 
 ```sh
 cd ~/code/myproject
 /path/to/sbx/bin/sbx setup
 ```
 
-This creates the project's Lima VM, builds the proxy and the fat sandbox
-image (Rust, Go, Node, Python, Java, Ruby, plus the devbase-core CLI subset:
-ripgrep, fzf, bat, eza, delta, fd, fish, kubectl), and starts the proxy. The
-sandbox image is ~3 GB and takes a few minutes on first build; subsequent
-projects reuse cached layers where possible.
+**Subsequent projects** skip the VM creation and the image builds; setup
+is essentially instant (one nerdctl network + one proxy container).
 
 Tip: put `sbx` on your PATH (`ln -s /path/to/sbx/bin/sbx ~/.local/bin/sbx`)
 so you can run `sbx setup` from anywhere.
@@ -79,13 +86,17 @@ runs but never leak across projects.
 ## Multiple projects
 
 ```sh
-cd ~/code/projA && sbx setup     # creates sbx-projA-<hash>
-cd ~/code/projB && sbx setup     # creates sbx-projB-<hash>, runs in parallel
+cd ~/code/projA && sbx setup     # registers projA, starts its proxy
+cd ~/code/projB && sbx setup     # registers projB, runs in parallel
+                                 #   no new VM, no image rebuild
 
-sbx status --all                 # list registered projects + VM names + state
+sbx status --all                 # list every registered project + state
 sbx status                       # detail for the project owning $PWD
-sbx reset                        # tear down the VM owning $PWD
-sbx reset --all                  # wipe every sbx-* VM
+sbx reset                        # tear down only the project owning $PWD
+sbx reset --all                  # tear down every project
+                                 #   (the shared Lima VM stays — remove with
+                                 #    'limactl delete sbx' if you want it gone)
+sbx prune                        # drop registry entries with no proxy container
 ```
 
 ## Egress allowlist
@@ -144,9 +155,16 @@ You'll see each DNS query and each SNI verdict (`-> 1.2.3.4:443` = forwarded,
 - No TLS interception, no custom CA in the sandbox. Hostname is the only
   decision point.
 
-This whole stack runs inside the project's own Lima VM. A separate project's
-VM is a separate kernel, separate filesystem, separate proxy, separate
-allowlist — full isolation between projects.
+On macOS the whole stack runs inside the shared Lima VM. On Linux it runs
+directly on the host via rootless containerd. Either way, projects are
+isolated from each other by **separate networks** (each project on its own
+`--internal` bridge), **separate filesystems** (each project bind-mounts
+only its own directory), **separate proxies** (each with its own allowlist),
+and **separate cache volumes**. Projects do **share a kernel** — the Lima
+VM's kernel on macOS, or the host kernel on Linux — so a kernel-level
+container escape from one project could in principle reach the others.
+Network/filesystem/allowlist boundaries hold against the threat models sbx
+actually targets (agent misbehaviour, accidental egress, unintended writes).
 
 ## File map
 
@@ -169,16 +187,21 @@ sandbox/                # sandbox image source (ubuntu 24.04 + every toolchain)
 
 ## Notes & gotchas
 
-- **UID/GID 501:20** is hard-coded to macOS defaults. If your host UID is
-  different (`id -u`/`id -g`), edit `sandbox/Dockerfile` and the `--user`
-  flag in `bin/sbx`.
-- **First setup per project is slow** — the sandbox image fetches rustup,
-  node, go, etc. inside the new VM. Subsequent projects reuse buildkit
-  layer cache where possible, but the cache is per-VM (one per project),
-  so cold builds aren't free across projects.
+- **UID/GID auto-detect.** `bin/sbx` reads `id -u`/`id -g` at startup and
+  passes them to `nerdctl build` (as `USER_UID`/`USER_GID` build args) and
+  `nerdctl run` (as `--user`). The sandbox image handles UID/GID
+  collisions (e.g. GID 20 = `dialout` on macOS hosts, UID 1000 = default
+  `ubuntu` user on some cloud images).
+- **First setup is slow, subsequent ones are instant.** The fat sandbox
+  image is ~3 GB and only built once; new projects just add a network and
+  a proxy container.
 - **AAAA queries** are dropped by dnsmasq so clients fall back to IPv4
   immediately instead of waiting for a timeout.
 - **Container-in-sandbox not supported.** Podman/Docker are intentionally
   not in the sandbox image. If you need them, build a separate image.
-- **`sbx reset` only nukes one project.** Use `sbx reset --all` to wipe
-  every sbx VM if you want a complete reset.
+- **`sbx reset` only nukes one project.** Use `sbx reset --all` to tear
+  down every project. The shared Lima VM stays — `limactl delete sbx` if
+  you want it removed entirely.
+- **Linux requires rootless containerd.** Set up with
+  `containerd-rootless-setuptool.sh install`. `sbx` will tell you if
+  `nerdctl` can't reach a containerd.
